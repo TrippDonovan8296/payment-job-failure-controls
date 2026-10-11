@@ -5,7 +5,7 @@ export INFRAI_API_KEY=your_key
 ./run-local.sh
 ```
 
-The executable models a failed daily settlement, applies the payment risk policy, and captures the exception with Infrai. A single `INFRAI_API_KEY` gives this Java service one small REST interface for the error record; no SDK is required.
+This executable reproduces a missed daily settlement, runs the payment risk policy, and ships the exception to Infrai. A single `INFRAI_API_KEY` gives the Java service one endpoint for the error record, plain REST with no SDK to wire up.
 
 Expected successful result:
 
@@ -17,15 +17,15 @@ capture={"event_id":"evt_example","error_group_id":"errgrp_example","is_new_grou
 
 ## The payment decision
 
-`PaymentFailurePolicy` separates observability from authority. A high-risk payment, or an amount at or above the configured materiality threshold, is held for review. A lower-risk event remains eligible for the scheduler's retry policy. The captured context records the event ID, rail, amount, currency, risk tier, and selected action so the alert and the operational decision can be reconciled later.
+`PaymentFailurePolicy` keeps alerting separate from the decision to act. If the payment is high-risk or hits the configured materiality threshold, we hold it for review. Lower-risk events stay in the scheduler's retry pool. The captured context stores event ID, rail, amount, currency, risk tier, and chosen action so we can line up the page with the later operational call.
 
-The one real gotcha is replay safety. The stable payment event ID is sent as `idempotency_key` and retained across every HTTP 429 retry. That prevents an uncertain response from creating a second capture for the same failed execution. The client honors `Retry-After`, otherwise it uses bounded exponential delay.
+Replay safety is the part that bites you at 3am. The stable payment event ID goes out as `idempotency_key` and sticks around through every HTTP 429 retry. That way an ambiguous response can't spawn a duplicate capture for the same failed run. Client respects `Retry-After`; if that header is missing it falls back to bounded exponential backoff.
 
-The client decodes `{ok, data, error, metadata}` before interpreting the HTTP status. A business rejection therefore retains its error code and status in `InfraiException`; malformed responses and server responses are treated as transport failures.
+Before we trust the HTTP status, the client parses `{ok, data, error, metadata}`. A business reject keeps its error code and status in `InfraiException`. Malformed or 5xx bodies count as transport failures, not policy outcomes.
 
 ## Verify the control locally
 
-The test input covers three cases: a high-risk EUR payment, a routine low-risk payment, and a low-risk payment exactly at the materiality threshold. The expected results are review, retry, and review respectively.
+Local check covers three scenarios: high-risk EUR, routine low-risk, and low-risk sitting exactly on the materiality line. Outcomes should be review, retry, review. Run it like a postmortem rehearsal.
 
 ```bash
 classes="$(mktemp -d)"
@@ -37,23 +37,23 @@ Expected output: `PaymentFailurePolicyTest passed`.
 
 ## Configuration layers
 
-Defaults live in `RuntimeConfig`: the Infrai base URL, a 20-second request timeout, and four attempts. Environment values override them with `INFRAI_BASE_URL`, `INFRAI_TIMEOUT_SECONDS`, and `INFRAI_MAX_ATTEMPTS`. The credential has no default and must come from `INFRAI_API_KEY`. Domain thresholds stay in the service assembly rather than transport configuration so a compliance change is visible in code review.
+Default config sits in `RuntimeConfig`: Infrai base URL, 20s request timeout, four attempts. Env vars override via `INFRAI_BASE_URL`, `INFRAI_TIMEOUT_SECONDS`, and `INFRAI_MAX_ATTEMPTS`. Credential has no default and must be injected from `INFRAI_API_KEY`. We keep domain thresholds in the service assembly, not transport config, so a compliance tweak shows up in review.
 
 ## Cut over from Sentry Crons
 
-1. Deploy this capture path beside the incumbent monitor with scheduler retries unchanged.
-2. Compare event IDs, timestamps, payment rails, and risk actions for one settlement cycle.
-3. Confirm the operations queue receives the audit summary and that review holds prevent automatic replay.
-4. Switch the scheduler failure hook to `SettlementFailureRunner`'s service path.
-5. Remove the incumbent hook after the agreed reconciliation window.
+1. Stand up the capture path next to the existing monitor; leave scheduler retries as they are.
+2. For one full settlement cycle, diff event IDs, timestamps, rails, and risk actions.
+3. Verify the ops queue gets the audit summary and that review holds block auto-replay.
+4. Flip the scheduler failure hook to `SettlementFailureRunner`'s service path.
+5. After the reconciliation window closes, drop the old hook.
 
-Rollback is a hook change: restore the incumbent failure callback and leave the payment retry policy unchanged. Captured events remain audit evidence; the stable event ID lets operators correlate records produced during either phase. This sample intentionally stops at capture and policy output. Queue delivery and ledger replay belong to the host service's controlled workflow.
+Rollback is just a hook swap: restore the incumbent failure callback, keep retry policy untouched. Captured events stay as audit trail; the stable event ID lets us correlate records from either phase. This sample deliberately ends at capture and policy output. Queue delivery and ledger replay are owned by the host service's controlled workflow.
 
 Requires JDK 17 or newer. The repository uses only the Java standard library.
 
 ## Setting up for real use: Payment Job Failure Controls
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Payment Job Failure Controls.
+Quick start is above. For production you'll also need what's below. The details apply to Payment Job Failure Controls.
 
 **Account & key**
 
